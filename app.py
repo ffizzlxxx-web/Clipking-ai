@@ -1,118 +1,221 @@
 import streamlit as st
-import subprocess, tempfile, os, json, math
-from pathlib import Path
+import subprocess
+import tempfile
+import os
 import numpy as np
+import wave
+import zipfile
+from pathlib import Path
 
-st.set_page_config(page_title="ClipKing AI", page_icon="👑", layout="centered")
+st.set_page_config(
+    page_title="ClipKing AI",
+    page_icon="👑",
+    layout="centered"
+)
 
 st.markdown("""
 <style>
-.block-container {max-width: 850px; padding-top: 2rem;}
-.hero {padding: 1.4rem; border-radius: 18px; background: linear-gradient(120deg,#17172e,#38205d); color:white;}
-.hero h1 {margin:0; font-size:2.2rem;}
-.small {opacity:.85}
+.stApp {
+    background: #0e1117;
+    color: white;
+}
+h1 {
+    color: #a78bfa;
+    text-align: center;
+}
+.stButton button {
+    background: #8b5cf6;
+    color: white;
+    border-radius: 10px;
+    width: 100%;
+}
 </style>
-<div class="hero">
-<h1>👑 ClipKing AI</h1>
-<p class="small">Turn your gaming videos into short highlight clips.</p>
-</div>
 """, unsafe_allow_html=True)
 
-st.info("MVP version: upload a video file you own or have permission to edit. The app finds high-energy audio moments and cuts short clips automatically.")
+st.title("👑 ClipKing AI")
+st.subheader("AI Gaming Shorts Generator")
 
-uploaded = st.file_uploader("Upload a video", type=["mp4", "mov", "mkv", "webm"])
-c1, c2, c3 = st.columns(3)
-with c1:
-    clip_len = st.slider("Clip length (seconds)", 15, 60, 30, 5)
-with c2:
-    count = st.slider("Number of clips", 1, 10, 5)
-with c3:
-    gap = st.slider("Minimum gap (seconds)", 10, 120, 30, 5)
+st.info("Upload your video and automatically create highlight clips.")
+
+uploaded = st.file_uploader(
+    "🎮 Upload Gaming Video",
+    type=["mp4", "mov", "mkv", "webm"]
+)
+
+st.markdown("### ⚙️ Advanced Settings")
+
+clip_len = st.slider("Clip Length", 10, 60, 30)
+count = st.slider("Number of Clips", 1, 10, 5)
+gap = st.slider("Minimum Gap", 10, 120, 30)
+
+vertical = st.checkbox("📱 Convert to 9:16 Shorts", True)
+
+captions = st.checkbox("Enable Auto Captions (requires Whisper)", False)
 
 def run(cmd):
-    p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
     if p.returncode != 0:
-        raise RuntimeError(p.stderr[-2500:])
+        raise RuntimeError(p.stderr[-2000:])
     return p.stdout
 
 def get_duration(path):
-    out = run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-               "-of", "default=noprint_wrappers=1:nokey=1", str(path)])
+    out = run([
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(path)
+    ])
     return float(out.strip())
 
-def extract_energy(path, workdir):
-    wav = Path(workdir) / "audio.wav"
-    run(["ffmpeg", "-y", "-i", str(path), "-vn", "-ac", "1", "-ar", "8000",
-         "-acodec", "pcm_s16le", str(wav)])
-    import wave
-    with wave.open(str(wav), "rb") as wf:
-        rate = wf.getframerate()
-        frames = wf.readframes(wf.getnframes())
-    audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-    step = rate * 2
-    vals = []
-    for i in range(0, len(audio), step):
-        chunk = audio[i:i+step]
-        vals.append(float(np.sqrt(np.mean(chunk * chunk))) if len(chunk) else 0.0)
-    return np.array(vals), 2.0
+def detect_moments(path, workdir, duration):
+    audio = Path(workdir) / "audio.wav"
 
-def choose_moments(energy, step, duration, clip_len, count, gap):
-    n = len(energy)
-    if n == 0:
+    run([
+        "ffmpeg", "-y", "-i", str(path),
+        "-vn", "-ac", "1",
+        "-ar", "16000",
+        str(audio)
+    ])
+
+    with wave.open(str(audio), "rb") as f:
+        rate = f.getframerate()
+        frames = f.readframes(f.getnframes())
+
+    samples = np.frombuffer(frames, dtype=np.int16)
+    samples = samples.astype(np.float32) / 32768
+
+    step = rate // 2
+    energy = []
+
+    for i in range(0, len(samples), step):
+        chunk = samples[i:i+step]
+        energy.append(
+            float(np.sqrt(np.mean(chunk ** 2)))
+            if len(chunk) else 0
+        )
+
+    energy = np.array(energy)
+
+    if len(energy) == 0:
         return []
-    # Smooth energy to avoid choosing a single noisy spike.
-    kernel = np.ones(5) / 5
-    smooth = np.convolve(energy, kernel, mode="same")
+
+    smooth = np.convolve(
+        energy, np.ones(5)/5, mode="same"
+    )
+
     candidates = np.argsort(smooth)[::-1]
     chosen = []
     half = clip_len / 2
+
     for idx in candidates:
-        center = idx * step + step / 2
-        start = max(0, min(duration - clip_len, center - half))
+        center = idx * 0.5
+        start = max(0, min(duration-clip_len, center-half))
         end = start + clip_len
+
         if duration <= clip_len:
             start, end = 0, duration
-        if all(end + gap <= s or start >= e + gap for s, e in chosen):
+
+        if all(
+            end + gap <= s or start >= e + gap
+            for s, e in chosen
+        ):
             chosen.append((start, end))
+
         if len(chosen) >= count:
             break
+
     return sorted(chosen)
 
-if uploaded:
-    st.video(uploaded)
-    if st.button("✨ Find highlights & create clips", type="primary", use_container_width=True):
-        with st.spinner("Analyzing audio and creating clips..."):
-            try:
-                with tempfile.TemporaryDirectory() as td:
-                    source = Path(td) / uploaded.name
-                    source.write_bytes(uploaded.getbuffer())
-                    duration = get_duration(source)
-                    energy, step = extract_energy(source, td)
-                    moments = choose_moments(energy, step, duration, clip_len, count, gap)
-                    if not moments:
-                        st.warning("No suitable moments found. Try a longer video.")
-                    else:
-                        outdir = Path(td) / "clips"
-                        outdir.mkdir()
-                        results = []
-                        progress = st.progress(0)
-                        for i, (start, end) in enumerate(moments, 1):
-                            out = outdir / f"ClipKing_clip_{i:02d}.mp4"
-                            run(["ffmpeg", "-y", "-ss", f"{start:.2f}", "-i", str(source),
-                                 "-t", f"{end-start:.2f}", "-vf",
-                                 "scale=720:1280:force_original_aspect_ratio=decrease,pad=720:1280:(ow-iw)/2:(oh-ih)/2",
-                                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-                                 "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(out)])
-                            results.append((out.name, out.read_bytes(), start, end))
-                            progress.progress(i / len(moments))
-                        st.success(f"Created {len(results)} clips!")
-                        for name, data, start, end in results:
-                            with st.expander(f"{name} · {int(start)}s–{int(end)}s", expanded=True):
-                                st.video(data)
-                                st.download_button("⬇️ Download clip", data, file_name=name,
-                                                   mime="video/mp4", key=name)
-            except Exception as e:
-                st.error("Something went wrong while processing this video.")
-                st.code(str(e))
+def make_clip(path, output, start, end):
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start),
+        "-i", str(path),
+        "-t", str(end-start)
+    ]
 
-st.caption("Note: This first version detects loud/high-energy moments; it does not understand gameplay or guarantee viral moments. YouTube links are not imported in this version. Use your own video file or one you have permission to edit.")
+    if vertical:
+        cmd += [
+            "-vf",
+            "scale=1080:1920:force_original_aspect_ratio=increase,"
+            "crop=1080:1920"
+        ]
+    else:
+        cmd += ["-vf", "scale=1280:-2"]
+
+    cmd += [
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-movflags", "+faststart",
+        str(output)
+    ]
+
+    run(cmd)
+
+if uploaded:
+    st.success("Video uploaded successfully!")
+
+    if st.button("🚀 Generate AI Clips"):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / uploaded.name
+            source.write_bytes(uploaded.getvalue())
+
+            try:
+                duration = get_duration(source)
+
+                if duration <= 0:
+                    st.error("Invalid video duration.")
+                    st.stop()
+
+                with st.spinner("🤖 Detecting best moments..."):
+                    moments = detect_moments(
+                        source, temp, duration
+                    )
+
+                if not moments:
+                    st.error("No highlight moments found.")
+                    st.stop()
+
+                clips = []
+
+                progress = st.progress(0)
+
+                for i, (start, end) in enumerate(moments):
+                    output = Path(temp) / f"ClipKing_{i+1}.mp4"
+
+                    with st.spinner(f"Creating clip {i+1}..."):
+                        make_clip(source, output, start, end)
+
+                    clips.append(output)
+                    progress.progress((i+1)/len(moments))
+
+                zip_path = Path(temp) / "ClipKing_Clips.zip"
+
+                with zipfile.ZipFile(zip_path, "w") as z:
+                    for clip in clips:
+                        z.write(clip, clip.name)
+
+                st.success(f"🎉 {len(clips)} clips created!")
+
+                for clip in clips:
+                    st.video(str(clip))
+
+                st.download_button(
+                    "📥 Download All Clips",
+                    data=zip_path.read_bytes(),
+                    file_name="ClipKing_AI_Clips.zip",
+                    mime="application/zip"
+                )
+
+            except Exception as e:
+                st.error(f"Error: {e}")
+
+st.markdown("---")
+st.caption("👑 ClipKing AI | Advanced Gaming Video Editor")
